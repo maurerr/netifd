@@ -70,7 +70,7 @@ _wdev_prepare_channel() {
 	}
 
 	case "$hwmode" in
-		a|b|g) ;;
+		a|b|g|ad) ;;
 		*)
 			if [ "$channel" -gt 14 ]; then
 				hwmode=a
@@ -200,6 +200,7 @@ wireless_vif_parse_encryption() {
 		*tkip+aes|*tkip+ccmp|*aes+tkip|*ccmp+tkip) wpa_cipher="CCMP TKIP";;
 		*aes|*ccmp) wpa_cipher="CCMP";;
 		*tkip) wpa_cipher="TKIP";;
+		*gcmp) wpa_cipher="GCMP";;
 	esac
 
 	# 802.11n requires CCMP for WPA

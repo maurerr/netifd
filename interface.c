@@ -269,6 +269,7 @@ mark_interface_down(struct interface *iface)
 	iface->state = IFS_DOWN;
 	switch (state) {
 	case IFS_UP:
+	case IFS_TEARDOWN:
 		interface_event(iface, IFEV_DOWN);
 		break;
 	case IFS_SETUP:
@@ -342,11 +343,11 @@ interface_check_state(struct interface *iface)
 	case IFS_UP:
 	case IFS_SETUP:
 		if (!iface->enabled || !link_state) {
-			interface_proto_event(iface->proto, PROTO_CMD_TEARDOWN, false);
+			iface->state = IFS_TEARDOWN;
 			if (iface->dynamic)
 				__set_config_state(iface, IFC_REMOVE);
 
-			mark_interface_down(iface);
+			interface_proto_event(iface->proto, PROTO_CMD_TEARDOWN, false);
 		}
 		break;
 	case IFS_DOWN:
@@ -496,7 +497,7 @@ interface_add_assignment_classes(struct interface *iface, struct blob_attr *list
 		if (blobmsg_type(cur) != BLOBMSG_TYPE_STRING)
 			continue;
 
-		if (!blobmsg_check_attr(cur, NULL))
+		if (!blobmsg_check_attr(cur, false))
 			continue;
 
 		struct interface_assignment_class *c = malloc(sizeof(*c) + blobmsg_data_len(cur));
@@ -1197,7 +1198,7 @@ static void
 interface_change_config(struct interface *if_old, struct interface *if_new)
 {
 	struct blob_attr *old_config = if_old->config;
-	bool reload = false, reload_ip = false;
+	bool reload = false, reload_ip = false, update_prefix_delegation = false;
 
 #define FIELD_CHANGED_STR(field)					\
 		((!!if_old->field != !!if_new->field) ||		\
@@ -1247,6 +1248,11 @@ interface_change_config(struct interface *if_old, struct interface *if_new)
 	if_old->force_link = if_new->force_link;
 	if_old->dns_metric = if_new->dns_metric;
 
+	if (if_old->proto_ip.no_delegation != if_new->proto_ip.no_delegation) {
+		if_old->proto_ip.no_delegation = if_new->proto_ip.no_delegation;
+		update_prefix_delegation = true;
+	}
+
 	if_old->proto_ip.no_dns = if_new->proto_ip.no_dns;
 	interface_replace_dns(&if_old->config_ip, &if_new->config_ip);
 
@@ -1275,6 +1281,9 @@ interface_change_config(struct interface *if_old, struct interface *if_new)
 		interface_ip_set_enabled(&if_old->proto_ip, proto_ip_enabled);
 		interface_ip_set_enabled(&if_old->config_ip, config_ip_enabled);
 	}
+
+	if (update_prefix_delegation)
+		interface_update_prefix_delegation(&if_old->proto_ip);
 
 	interface_write_resolv_conf();
 	if (if_old->main_dev.dev)

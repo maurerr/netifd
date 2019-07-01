@@ -20,6 +20,10 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 
+#ifdef linux
+#include <netinet/ether.h>
+#endif
+
 #include "netifd.h"
 #include "device.h"
 #include "interface.h"
@@ -62,6 +66,28 @@ static const struct blobmsg_policy route_attr[__ROUTE_MAX] = {
 const struct uci_blob_param_list route_attr_list = {
 	.n_params = __ROUTE_MAX,
 	.params = route_attr,
+};
+
+enum {
+	NEIGHBOR_INTERFACE,
+	NEIGHBOR_ADDRESS,
+	NEIGHBOR_MAC,
+	NEIGHBOR_PROXY,
+	NEIGHBOR_ROUTER,
+	__NEIGHBOR_MAX
+};
+
+static const struct blobmsg_policy neighbor_attr[__NEIGHBOR_MAX]={
+	[NEIGHBOR_INTERFACE]= { .name = "interface", .type = BLOBMSG_TYPE_STRING},
+	[NEIGHBOR_ADDRESS]= { .name = "ipaddr", .type = BLOBMSG_TYPE_STRING},
+	[NEIGHBOR_MAC]= { .name = "mac", .type = BLOBMSG_TYPE_STRING},
+	[NEIGHBOR_PROXY]= { .name = "proxy", .type = BLOBMSG_TYPE_BOOL},
+	[NEIGHBOR_ROUTER]= {.name = "router", .type = BLOBMSG_TYPE_BOOL},
+};
+
+const struct uci_blob_param_list neighbor_attr_list = {
+	.n_params = __NEIGHBOR_MAX,
+	.params = neighbor_attr,
 };
 
 
@@ -169,6 +195,10 @@ __find_ip_addr_target(struct interface_ip_settings *ip, union if_addr *a, bool v
 
 		if (v6 != ((addr->flags & DEVADDR_FAMILY) == DEVADDR_INET6))
 			continue;
+
+		if (((addr->flags & DEVADDR_FAMILY) == DEVADDR_INET4) &&
+				addr->point_to_point && a->in.s_addr == addr->point_to_point)
+			return true;
 
 		/* Handle offlink addresses correctly */
 		unsigned int mask = addr->mask;
@@ -299,6 +329,64 @@ interface_set_route_info(struct interface *iface, struct device_route *route)
 }
 
 void
+interface_ip_add_neighbor(struct interface *iface, struct blob_attr *attr, bool v6)
+{
+	struct interface_ip_settings *ip;
+	struct blob_attr *tb[__NEIGHBOR_MAX], *cur;
+	struct device_neighbor *neighbor;
+	int af = v6 ? AF_INET6: AF_INET;
+	struct ether_addr *ea;
+
+	blobmsg_parse(neighbor_attr, __NEIGHBOR_MAX, tb, blobmsg_data(attr), blobmsg_data_len(attr));
+
+	if (!iface) {
+		if ((cur = tb[NEIGHBOR_INTERFACE]) == NULL)
+			return;
+
+		iface = vlist_find(&interfaces, blobmsg_data(cur), iface, node);
+
+		if (!iface)
+			return;
+
+		ip = &iface->config_ip;
+	} else
+		ip = &iface->proto_ip;
+
+	neighbor = calloc(1,sizeof(*neighbor));
+	neighbor->flags = v6 ? DEVADDR_INET6 : DEVADDR_INET4;
+
+	if (!neighbor)
+		return;
+
+	if ((cur = tb[NEIGHBOR_ADDRESS]) != NULL){
+		if (!inet_pton(af, blobmsg_data(cur), &neighbor->addr))
+			goto error;
+	} else
+		goto error;
+
+	if ((cur = tb[NEIGHBOR_MAC]) != NULL) {
+		neighbor->flags |= DEVNEIGH_MAC;
+		ea = ether_aton(blobmsg_data(cur));
+		if (!ea)
+			goto error;
+
+		memcpy(neighbor->macaddr, ea, 6);
+	}
+
+	if ((cur = tb[NEIGHBOR_PROXY]) != NULL)
+		neighbor->proxy = blobmsg_get_bool(cur);
+
+	if ((cur = tb[NEIGHBOR_ROUTER]) != NULL)
+		neighbor->router = blobmsg_get_bool(cur);
+
+	vlist_add(&ip->neighbor, &neighbor->node, neighbor);
+	return;
+
+error:
+	free(neighbor);
+}
+
+void
 interface_ip_add_route(struct interface *iface, struct blob_attr *attr, bool v6)
 {
 	struct interface_ip_settings *ip;
@@ -426,6 +514,14 @@ addr_cmp(const void *k1, const void *k2, void *ptr)
 {
 	return memcmp(k1, k2, sizeof(struct device_addr) -
 		      offsetof(struct device_addr, flags));
+}
+
+static int
+neighbor_cmp(const void *k1, const void *k2, void *ptr)
+{
+	const struct device_neighbor *n1 = k1, *n2 = k2;
+
+	return memcmp(&n1->addr, &n2->addr, sizeof(n2->addr));
 }
 
 static int
@@ -622,6 +718,44 @@ enable_route(struct interface_ip_settings *ip, struct device_route *route)
 		return false;
 
 	return ip->enabled;
+}
+
+static void
+interface_update_proto_neighbor(struct vlist_tree *tree,
+				struct vlist_node * node_new,
+				struct vlist_node *node_old)
+{
+	struct device *dev;
+	struct device_neighbor *neighbor_old, *neighbor_new;
+	struct interface_ip_settings *ip;
+	bool keep = false;
+
+	ip = container_of(tree, struct interface_ip_settings, neighbor);
+	dev = ip->iface->l3_dev.dev;
+
+	neighbor_old = container_of(node_old, struct device_neighbor, node);
+	neighbor_new = container_of(node_new, struct device_neighbor, node);
+
+	if (node_old && node_new) {
+		keep = (!memcmp(neighbor_old->macaddr, neighbor_new->macaddr, sizeof(neighbor_old->macaddr)) &&
+			(neighbor_old->proxy == neighbor_new->proxy) &&
+			(neighbor_old->router == neighbor_new->router));
+	}
+
+	if (node_old) {
+		if (!keep && neighbor_old->enabled)
+			system_del_neighbor(dev, neighbor_old);
+
+		free(neighbor_old);
+	}
+
+	if (node_new) {
+		if (!keep && ip->enabled)
+			if (system_add_neighbor(dev, neighbor_new))
+				neighbor_new->failed = true;
+
+		neighbor_new->enabled = ip->enabled;
+	}
 }
 
 static void
@@ -852,8 +986,8 @@ interface_set_prefix_address(struct device_prefix_assignment *assignment,
 			int mtu_old = system_update_ipv6_mtu(l3_downlink, 0);
 
 			if (mtu > 0 && mtu_old != mtu) {
-				if (system_update_ipv6_mtu(l3_downlink, mtu) < 0)
-					netifd_log_message(L_WARNING, "Failed to set IPv6 mtu to %d"
+				if (system_update_ipv6_mtu(l3_downlink, mtu) < 0 && mtu < mtu_old)
+					netifd_log_message(L_WARNING, "Failed to set IPv6 mtu to %d "
 							"on interface '%s'\n", mtu, iface->name);
 			}
 		}
@@ -1053,6 +1187,20 @@ void interface_refresh_assignments(bool hint)
 	refresh = hint;
 }
 
+void interface_update_prefix_delegation(struct interface_ip_settings *ip)
+{
+	struct device_prefix *prefix;
+
+	vlist_for_each_element(&ip->prefix, prefix, node) {
+		interface_update_prefix_assignments(prefix, !ip->no_delegation);
+
+		if (ip->no_delegation) {
+			if (prefix->head.next)
+				list_del(&prefix->head);
+		} else
+			list_add(&prefix->head, &prefixes);
+	}
+}
 
 static void
 interface_update_prefix(struct vlist_tree *tree,
@@ -1214,7 +1362,7 @@ interface_add_dns_server_list(struct interface_ip_settings *ip, struct blob_attr
 		if (blobmsg_type(cur) != BLOBMSG_TYPE_STRING)
 			continue;
 
-		if (!blobmsg_check_attr(cur, NULL))
+		if (!blobmsg_check_attr(cur, false))
 			continue;
 
 		interface_add_dns_server(ip, blobmsg_data(cur));
@@ -1246,7 +1394,7 @@ interface_add_dns_search_list(struct interface_ip_settings *ip, struct blob_attr
 		if (blobmsg_type(cur) != BLOBMSG_TYPE_STRING)
 			continue;
 
-		if (!blobmsg_check_attr(cur, NULL))
+		if (!blobmsg_check_attr(cur, false))
 			continue;
 
 		interface_add_dns_search_domain(ip, blobmsg_data(cur));
@@ -1380,6 +1528,7 @@ void interface_ip_set_enabled(struct interface_ip_settings *ip, bool enabled)
 {
 	struct device_addr *addr;
 	struct device_route *route;
+	struct device_neighbor *neighbor;
 	struct device *dev;
 	struct interface *iface;
 
@@ -1425,7 +1574,6 @@ void interface_ip_set_enabled(struct interface_ip_settings *ip, bool enabled)
 
 		if (!enable_route(ip, route))
 			_enabled = false;
-
 		if (route->enabled == _enabled)
 			continue;
 
@@ -1437,6 +1585,19 @@ void interface_ip_set_enabled(struct interface_ip_settings *ip, bool enabled)
 		} else
 			system_del_route(dev, route);
 		route->enabled = _enabled;
+	}
+
+	vlist_for_each_element(&ip->neighbor, neighbor, node) {
+		if (neighbor->enabled == enabled)
+			continue;
+
+		if (enabled) {
+			if(system_add_neighbor(dev, neighbor))
+				neighbor->failed = true;
+		} else
+			system_del_neighbor(dev, neighbor);
+
+		neighbor->enabled = enabled;
 	}
 
 	struct device_prefix *c;
@@ -1467,6 +1628,7 @@ interface_ip_update_start(struct interface_ip_settings *ip)
 	vlist_update(&ip->route);
 	vlist_update(&ip->addr);
 	vlist_update(&ip->prefix);
+	vlist_update(&ip->neighbor);
 }
 
 void
@@ -1477,6 +1639,7 @@ interface_ip_update_complete(struct interface_ip_settings *ip)
 	vlist_flush(&ip->route);
 	vlist_flush(&ip->addr);
 	vlist_flush(&ip->prefix);
+	vlist_flush(&ip->neighbor);
 	interface_write_resolv_conf();
 }
 
@@ -1489,6 +1652,7 @@ interface_ip_flush(struct interface_ip_settings *ip)
 	vlist_simple_flush_all(&ip->dns_search);
 	vlist_flush_all(&ip->route);
 	vlist_flush_all(&ip->addr);
+	vlist_flush_all(&ip->neighbor);
 	vlist_flush_all(&ip->prefix);
 }
 
@@ -1500,6 +1664,7 @@ __interface_ip_init(struct interface_ip_settings *ip, struct interface *iface)
 	vlist_simple_init(&ip->dns_search, struct dns_search_domain, node);
 	vlist_simple_init(&ip->dns_servers, struct dns_server, node);
 	vlist_init(&ip->route, route_cmp, interface_update_proto_route);
+	vlist_init(&ip->neighbor, neighbor_cmp, interface_update_proto_neighbor);
 	vlist_init(&ip->addr, addr_cmp, interface_update_proto_addr);
 	vlist_init(&ip->prefix, prefix_cmp, interface_update_prefix);
 }
